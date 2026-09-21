@@ -468,6 +468,9 @@ void MultiHistEvaluator::Reset(Context const *ctx,
                        auto n_cats = feature_segments[fidx + 1] - feature_segments[fidx];
                        return !common::UseOneHot(n_cats, max_cat_to_onehot);
                      });
+  CHECK(!(this->need_sort_histogram_ && param.cat_order == TrainParam::kTree))
+      << "`cat_order=tree` is not yet supported by the multi-target GPU hist evaluator when "
+         "partition-based categorical splits are used.";
 }
 
 [[nodiscard]] MultiExpandEntry MultiHistEvaluator::EvaluateSingleSplit(

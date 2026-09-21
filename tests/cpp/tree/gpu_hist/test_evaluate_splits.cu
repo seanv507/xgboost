@@ -499,4 +499,92 @@ TEST_F(TestPartitionBasedSplit, GpuHist) {
   auto split = evaluator.EvaluateSingleSplit(&ctx, input, shared_inputs).split;
   ASSERT_NEAR(split.loss_chg, best_score_, 1e-2);
 }
+
+TEST_F(TestPartitionBasedSplit, GpuHistCatOrderTree) {
+  auto ctx = MakeCUDACtx(0);
+  param_.UpdateAllowUnknown(Args{{"cat_order", "tree"}});
+  dh::device_vector<FeatureType> ft{std::vector<FeatureType>{FeatureType::kCategorical}};
+  GPUHistEvaluator evaluator{param_, static_cast<bst_feature_t>(info_.num_col_), ctx.Device()};
+
+  cuts_.cut_ptrs_.SetDevice(ctx.Device());
+  cuts_.cut_values_.SetDevice(ctx.Device());
+  evaluator.Reset(&ctx, cuts_, dh::ToSpan(ft), info_.num_col_, param_);
+
+  auto quantiser = DummyRoundingFactor(&ctx);
+  EvaluateSplitSharedInputs shared_inputs{EvalParam{param_},
+                                          quantiser,
+                                          dh::ToSpan(ft),
+                                          cuts_.cut_ptrs_.ConstDeviceSpan(),
+                                          cuts_.cut_values_.ConstDeviceSpan(),
+                                          false};
+  dh::device_vector<bst_feature_t> feature_set{std::vector<bst_feature_t>{0}};
+
+  // The order is computed with the root node, so it's the same as the per-node one.
+  thrust::host_vector<GradientPairInt64> h_root_hist;
+  for (auto e : hist_[0]) {
+    h_root_hist.push_back(quantiser.ToFixedPoint(e));
+  }
+  dh::device_vector<GradientPairInt64> d_root_hist = h_root_hist;
+  EvaluateSplitInputs root_input{0, 0, quantiser.ToFixedPoint(total_gpair_),
+                                 dh::ToSpan(feature_set), dh::ToSpan(d_root_hist)};
+  auto root_split = evaluator.EvaluateSingleSplit(&ctx, root_input, shared_inputs).split;
+  ASSERT_NEAR(root_split.loss_chg, best_score_, 1e-2);
+
+  // Evaluate a child node with a different histogram. The candidates should be limited to
+  // the partitions that are contiguous in the order of the root.
+  SimpleLCG lcg;
+  lcg.Seed(7);
+  SimpleRealUniformDistribution<double> grad_dist{-4.0, 4.0};
+  SimpleRealUniformDistribution<double> hess_dist{0.5, 4.0};
+  std::vector<GradientPairPrecise> child_hist(n_bins_);
+  GradientPairPrecise child_sum;
+  thrust::host_vector<GradientPairInt64> h_child_hist;
+  for (auto &e : child_hist) {
+    e = GradientPairPrecise{grad_dist(&lcg), hess_dist(&lcg)};
+    child_sum += e;
+    h_child_hist.push_back(quantiser.ToFixedPoint(e));
+  }
+  dh::device_vector<GradientPairInt64> d_child_hist = h_child_hist;
+  EvaluateSplitInputs child_input{1, 1, quantiser.ToFixedPoint(child_sum),
+                                  dh::ToSpan(feature_set), dh::ToSpan(d_child_hist)};
+  dh::device_vector<EvaluateSplitInputs> inputs{std::vector<EvaluateSplitInputs>{child_input}};
+  dh::device_vector<GPUExpandEntry> out_entries(1);
+  evaluator.EvaluateSplits(&ctx, {child_input.nidx}, child_input.feature_set.size(),
+                           dh::ToSpan(inputs), shared_inputs, dh::ToSpan(out_entries));
+  GPUExpandEntry child_entry = out_entries[0];
+  ASSERT_TRUE(child_entry.split.is_cat);
+
+  // Enumerate the prefixes of the root order using the statistics of the child.
+  TreeEvaluator tree_evaluator{param_, 1, DeviceOrd::CPU(), 1u};
+  auto eval = tree_evaluator.GetEvaluator();
+  auto root_hist = hist_[0];
+  std::vector<std::size_t> root_order(n_bins_);
+  std::iota(root_order.begin(), root_order.end(), 0);
+  std::stable_sort(root_order.begin(), root_order.end(), [&](std::size_t l, std::size_t r) {
+    return eval.CalcWeightCat(param_, root_hist[l]) < eval.CalcWeightCat(param_, root_hist[r]);
+  });
+  auto parent_gain = eval.CalcGain(1, param_, GradStats{child_sum});
+  float best_child_score = -std::numeric_limits<float>::infinity();
+  GradientPairPrecise prefix;
+  for (std::size_t i = 0; i + 1 < n_bins_; ++i) {
+    prefix += child_hist[root_order[i]];
+    auto rest = child_sum - prefix;
+    auto score = eval.CalcSplitGain(param_, 1, 0, GradStats{prefix}, GradStats{rest}) - parent_gain;
+    best_child_score = std::max(best_child_score, score);
+  }
+  ASSERT_NEAR(child_entry.split.loss_chg, best_child_score, 1e-2);
+
+  // The stored categories should match the reported gain.
+  common::KCatBitField cats{evaluator.GetHostNodeCats(child_input.nidx)};
+  GradientPairPrecise chosen;
+  for (std::size_t c = 0; c < n_bins_; ++c) {
+    if (cats.Check(static_cast<bst_cat_t>(c))) {
+      chosen += child_hist[c];
+    }
+  }
+  auto rest = child_sum - chosen;
+  auto chosen_score =
+      eval.CalcSplitGain(param_, 1, 0, GradStats{chosen}, GradStats{rest}) - parent_gain;
+  ASSERT_NEAR(chosen_score, child_entry.split.loss_chg, 1e-2);
+}
 }  // namespace xgboost::tree

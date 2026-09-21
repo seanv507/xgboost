@@ -92,7 +92,11 @@ the gradient histogram to prepare the contiguous partitions then enumerate the s
 according to these sorted values. One of the related parameters for XGBoost is
 ``max_cat_to_onehot``, which controls whether one-hot encoding or partitioning should be
 used for each feature. Set ``max_cat_to_onehot=1`` to use partitioning for all categorical
-features. See :ref:`cat-param` for details.
+features. By default the categories are sorted for every node. Set
+``cat_order=tree`` to sort them only once for every tree using the root node and reuse the
+order for all nodes in the tree. This makes split finding cheaper for features with many
+categories, at the cost of considering fewer partitions in the child nodes. See
+:ref:`cat-param` for details.
 
 ===========
 Vector Leaf

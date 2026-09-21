@@ -289,7 +289,9 @@ __global__ __launch_bounds__(kBlockThreads) void EvaluateSplitsKernel(
       agent.OneHot(&best_split);
     } else {
       auto total_bins = shared_inputs.feature_values.size();
-      size_t offset = total_bins * input_idx;
+      // With `cat_order=tree`, all nodes share the order sorted at the root.
+      auto stride = shared_inputs.param.cat_order_per_tree ? 0 : total_bins;
+      size_t offset = stride * input_idx;
       auto node_sorted_idx = sorted_idx.subspan(offset, total_bins);
       agent.Partition(&best_split, node_sorted_idx, offset, shared_inputs.param);
     }
@@ -327,9 +329,12 @@ __device__ void SetCategoricalSplit(const EvaluateSplitSharedInputs &shared_inpu
   }
 
   // partition-based split
-  auto node_sorted_idx = d_sorted_idx.subspan(shared_inputs.feature_values.size() * input_idx,
-                                              shared_inputs.feature_values.size());
-  size_t node_offset = input_idx * shared_inputs.feature_values.size();
+  // With `cat_order=tree`, all nodes share the order sorted at the root.
+  std::size_t stride =
+      shared_inputs.param.cat_order_per_tree ? 0 : shared_inputs.feature_values.size();
+  auto node_sorted_idx =
+      d_sorted_idx.subspan(stride * input_idx, shared_inputs.feature_values.size());
+  size_t node_offset = stride * input_idx;
   auto const best_thresh = out_split.thresh;
   if (best_thresh == -1) {
     return;
@@ -351,8 +356,10 @@ void GPUHistEvaluator::LaunchEvaluateSplits(Context const *ctx, bst_feature_t ma
                                             EvaluateSplitSharedInputs shared_inputs,
                                             TreeEvaluator::SplitEvaluator<EvalParam> evaluator,
                                             common::Span<DeviceSplitCandidate> out_splits) {
-  if (need_sort_histogram_) {
+  if (need_sort_histogram_ && !(this->CatOrderPerTree() && tree_order_ready_)) {
+    // With `cat_order=tree`, this is the root node, see `EvaluateSplits`.
     this->SortHistogram(ctx, d_inputs, shared_inputs, evaluator);
+    tree_order_ready_ = this->CatOrderPerTree();
   }
 
   size_t combined_num_features = max_active_features * d_inputs.size();
@@ -402,6 +409,17 @@ void GPUHistEvaluator::EvaluateSplits(Context const *ctx, const std::vector<bst_
                                       EvaluateSplitSharedInputs shared_inputs,
                                       common::Span<GPUExpandEntry> out_entries) {
   auto evaluator = this->tree_evaluator_.template GetEvaluator<EvalParam>();
+
+  if (need_sort_histogram_ && this->CatOrderPerTree()) {
+    // The order is sorted with the root node and reused by the rest of the tree.
+    bool is_root = std::find(nidx.cbegin(), nidx.cend(), RegTree::kRoot) != nidx.cend();
+    if (is_root) {
+      CHECK_EQ(d_inputs.size(), 1UL) << "The root node must be evaluated alone.";
+      tree_order_ready_ = false;
+    }
+    CHECK(is_root || tree_order_ready_)
+        << "The root node must be evaluated before the other nodes when `cat_order=tree`.";
+  }
 
   dh::TemporaryArray<DeviceSplitCandidate> splits_out_storage(d_inputs.size());
   auto out_splits = dh::ToSpan(splits_out_storage);

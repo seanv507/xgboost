@@ -82,6 +82,11 @@ class GPUHistEvaluator {
   curt::Stream copy_stream_;
   // storage for sorted index of feature histogram, used for sort based splits.
   dh::device_vector<bst_feature_t> cat_sorted_idx_;
+  // Sorted index computed from the root node, shared by all nodes in the tree when
+  // `cat_order=tree`. It stores bin indices local to the histogram.
+  dh::device_vector<bst_feature_t> tree_sorted_idx_;
+  // Whether `tree_sorted_idx_` has been computed for the current tree.
+  bool tree_order_ready_ = false;
   // cached input for sorting the histogram, used for sort based splits.
   using SortPair = cuda::std::tuple<std::uint32_t, float>;
   dh::device_vector<SortPair> sort_input_;
@@ -100,6 +105,9 @@ class GPUHistEvaluator {
 
   // Copy the categories from device to host asynchronously.
   void CopyToHost(const std::vector<bst_node_t> &nidx);
+
+  // Whether the category order is computed once for each tree instead of each node.
+  [[nodiscard]] bool CatOrderPerTree() const { return param_.cat_order == TrainParam::kTree; }
 
   /**
    * \brief Get host category storage of nidx for internal calculation.
@@ -133,6 +141,11 @@ class GPUHistEvaluator {
    */
   auto SortedIdx(int num_nodes, bst_bin_t total_bins) {
     if (!need_sort_histogram_) return common::Span<bst_feature_t>{};
+    if (this->CatOrderPerTree()) {
+      // A single order is shared by all nodes.
+      tree_sorted_idx_.resize(total_bins);
+      return dh::ToSpan(tree_sorted_idx_);
+    }
     cat_sorted_idx_.resize(num_nodes * total_bins);
     return dh::ToSpan(cat_sorted_idx_);
   }

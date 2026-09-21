@@ -21,6 +21,7 @@ void GPUHistEvaluator::Reset(Context const *ctx, common::HistogramCuts const &cu
                              common::Span<FeatureType const> ft, bst_feature_t n_features,
                              TrainParam const &param) {
   param_ = param;
+  tree_order_ready_ = false;
   tree_evaluator_ = TreeEvaluator{param, n_features, ctx->Device(), 1u};
   has_categoricals_ = cuts.HasCategorical();
   if (cuts.HasCategorical()) {

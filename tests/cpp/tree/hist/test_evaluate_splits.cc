@@ -267,6 +267,85 @@ TEST_F(TestPartitionBasedSplit, CPUHist) {
   ASSERT_NEAR(entries[0].split.loss_chg, best_score_, 1e-16);
 }
 
+TEST_F(TestPartitionBasedSplit, CPUHistCatOrderTree) {
+  Context ctx;
+  param_.UpdateAllowUnknown(Args{{"cat_order", "tree"}});
+  std::vector<FeatureType> ft{FeatureType::kCategorical};
+  auto sampler = std::make_shared<common::ColumnSampler>();
+  HistEvaluator evaluator{&ctx, &param_, info_, sampler};
+  evaluator.InitRoot(GradStats{total_gpair_});
+  std::vector<CPUExpandEntry> entries(1);
+  evaluator.EvaluateSplits(hist_, cuts_, {ft}, &entries);
+  // The order is computed with the root node, so it's the same as the per-node one.
+  ASSERT_NEAR(entries[0].split.loss_chg, best_score_, 1e-16);
+
+  // Evaluate a child node with a different histogram. The candidates should be limited to
+  // the partitions that are contiguous in the order of the root.
+  hist_.AllocateHistograms({1});
+  auto root_hist = hist_[0];
+  auto child_hist = hist_[1];
+  SimpleLCG lcg;
+  lcg.Seed(7);
+  SimpleRealUniformDistribution<double> grad_dist{-4.0, 4.0};
+  SimpleRealUniformDistribution<double> hess_dist{0.5, 4.0};
+  GradientPairPrecise child_sum;
+  for (auto &e : child_hist) {
+    e = GradientPairPrecise{grad_dist(&lcg), hess_dist(&lcg)};
+    child_sum += e;
+  }
+  CPUExpandEntry split_root{0, 0};
+  split_root.split.loss_chg = 1.0f;
+  split_root.split.left_sum = GradStats{child_sum.GetGrad(), child_sum.GetHess()};
+  split_root.split.right_sum = GradStats{total_gpair_.GetGrad() - child_sum.GetGrad(),
+                                         total_gpair_.GetHess() - child_sum.GetHess()};
+  RegTree tree;
+  evaluator.ApplyTreeSplit(split_root, &tree);
+
+  std::vector<CPUExpandEntry> child_entries{CPUExpandEntry{tree[0].LeftChild(), 1}};
+  ASSERT_EQ(child_entries.front().nid, 1);
+  evaluator.EvaluateSplits(hist_, cuts_, {ft}, &child_entries);
+
+  // Enumerate the prefixes of the root order using the statistics of the child.
+  TreeEvaluator tree_evaluator{param_, 1, DeviceOrd::CPU(), 1u};
+  auto eval = tree_evaluator.GetEvaluator();
+  std::vector<std::size_t> root_order(n_bins_);
+  std::iota(root_order.begin(), root_order.end(), 0);
+  std::stable_sort(root_order.begin(), root_order.end(), [&](std::size_t l, std::size_t r) {
+    return eval.CalcWeightCat(param_, root_hist[l]) < eval.CalcWeightCat(param_, root_hist[r]);
+  });
+  auto parent_gain = eval.CalcGain(1, param_, GradStats{child_sum});
+  float best_child_score = -std::numeric_limits<float>::infinity();
+  GradientPairPrecise prefix;
+  for (std::size_t i = 0; i + 1 < n_bins_; ++i) {
+    prefix += child_hist[root_order[i]];
+    auto rest = child_sum - prefix;
+    auto score = eval.CalcSplitGain(param_, 1, 0, GradStats{prefix}, GradStats{rest}) - parent_gain;
+    best_child_score = std::max(best_child_score, score);
+  }
+  ASSERT_TRUE(child_entries.front().split.is_cat);
+  ASSERT_NEAR(child_entries.front().split.loss_chg, best_child_score, 1e-5);
+}
+
+TEST_F(TestPartitionBasedSplit, CPUHistCatOrderTreeNoRoot) {
+  Context ctx;
+  param_.UpdateAllowUnknown(Args{{"cat_order", "tree"}});
+  std::vector<FeatureType> ft{FeatureType::kCategorical};
+  auto sampler = std::make_shared<common::ColumnSampler>();
+  HistEvaluator evaluator{&ctx, &param_, info_, sampler};
+  evaluator.InitRoot(GradStats{total_gpair_});
+
+  hist_.AllocateHistograms({1});
+  CPUExpandEntry split_root{0, 0};
+  split_root.split.left_sum = GradStats{total_gpair_.GetGrad() / 2, total_gpair_.GetHess() / 2};
+  split_root.split.right_sum = split_root.split.left_sum;
+  RegTree tree;
+  evaluator.ApplyTreeSplit(split_root, &tree);
+
+  // No order is available since the root is never evaluated.
+  std::vector<CPUExpandEntry> entries{CPUExpandEntry{1, 1}};
+  ASSERT_THROW(evaluator.EvaluateSplits(hist_, cuts_, {ft}, &entries), dmlc::Error);
+}
+
 namespace {
 auto CompareOneHotAndPartition(bool onehot) {
   Context ctx;
@@ -484,6 +563,30 @@ TEST_F(TestHistMultiEvaluator, CategoricalPartition) {
   }
 
   this->ApplyTreeSplit();
+}
+
+TEST_F(TestHistMultiEvaluator, CategoricalPartitionCatOrderTree) {
+  this->SetHistData({{{-3.0, 1.0}, {-3.0, 1.0}, {-3.0, 1.0}},    // t-0
+                     {{-3.0, 1.0}, {-3.0, 1.0}, {-2.0, 1.0}}});  // t-1
+  root_sum_(0) += GradientPairPrecise{-3.0, 1.0};
+  root_sum_(1) += GradientPairPrecise{-2.0, 1.0};
+  // The order is computed with the root node, so it's the same as the per-node one.
+  this->EvaluateSplits(Args{{"max_cat_to_onehot", "1"}, {"cat_order", "tree"}});
+
+  auto const &split = entries_.front().split;
+  ASSERT_TRUE(split.is_cat);
+  ASSERT_FLOAT_EQ(split.loss_chg, 1.0f);
+  ASSERT_FALSE(split.DefaultLeft());
+
+  common::KCatBitField cat_bits{split.cat_bits};
+  ASSERT_FALSE(cat_bits.Check(0));
+  ASSERT_FALSE(cat_bits.Check(1));
+  ASSERT_TRUE(cat_bits.Check(2));
+  ASSERT_EQ(split.right_sum[0], GradientPairPrecise(-6.0, 2.0));
+  ASSERT_EQ(split.right_sum[1], GradientPairPrecise(-4.0, 2.0));
+  for (bst_target_t t = 0; t < kNTargets; ++t) {
+    ASSERT_EQ(split.left_sum[t] + split.right_sum[t], root_sum_(t));
+  }
 }
 
 }  // namespace xgboost::tree

@@ -12,19 +12,20 @@
 #include <utility>    // for move
 #include <vector>     // for vector
 
-#include "../../common/categorical.h"  // for CatBitField
-#include "../../common/hist_util.h"    // for GHistRow, HistogramCuts
-#include "../../common/linalg_op.h"    // for cbegin, cend, begin
-#include "../../common/random.h"       // for ColumnSampler
-#include "../constraints.h"            // for FeatureInteractionConstraintHost
-#include "../param.h"                  // for TrainParam
-#include "../split_evaluator.h"        // for TreeEvaluator
-#include "../tree_view.h"              // for MultiTargetTreeView
-#include "expand_entry.h"              // for MultiExpandEntry
-#include "hist_cache.h"                // for BoundedHistCollection
-#include "xgboost/base.h"              // for bst_node_t, bst_target_t, bst_feature_t
-#include "xgboost/context.h"           // for COntext
-#include "xgboost/linalg.h"            // for Constants, Vector
+#include "../../common/categorical.h"      // for CatBitField
+#include "../../common/hist_util.h"        // for GHistRow, HistogramCuts
+#include "../../common/linalg_op.h"        // for cbegin, cend, begin
+#include "../../common/random.h"           // for ColumnSampler
+#include "../../common/threading_utils.h"  // for ParallelFor
+#include "../constraints.h"                // for FeatureInteractionConstraintHost
+#include "../param.h"                      // for TrainParam
+#include "../split_evaluator.h"            // for TreeEvaluator
+#include "../tree_view.h"                  // for MultiTargetTreeView
+#include "expand_entry.h"                  // for MultiExpandEntry
+#include "hist_cache.h"                    // for BoundedHistCollection
+#include "xgboost/base.h"                  // for bst_node_t, bst_target_t, bst_feature_t
+#include "xgboost/context.h"               // for COntext
+#include "xgboost/linalg.h"                // for Constants, Vector
 
 namespace xgboost::tree {
 class HistEvaluator {
@@ -43,6 +44,10 @@ class HistEvaluator {
   TreeEvaluator tree_evaluator_;
   FeatureInteractionConstraintHost interaction_constraints_;
   std::vector<NodeEntry> snode_;
+  // Bin order of the partition-based categorical features computed from the root node,
+  // used by `cat_order=tree`. Feature `f` owns the range [cut_ptr[f], cut_ptr[f + 1]) and
+  // stores bin indices local to the feature. Reset by `InitRoot` for each tree.
+  std::vector<std::size_t> cat_order_;
 
   // if sum of statistics for non-missing values in the node
   // is equal to sum of statistics for all values:
@@ -198,6 +203,52 @@ class HistEvaluator {
     p_best->Update(best);
   }
 
+  /**
+   * @brief Sort the bins of a categorical feature by their weights, so that a partition
+   *        of the categories becomes contiguous.
+   *
+   * @param feat_hist  Histogram of a single feature.
+   * @param sorted_idx Output, bin indices local to the feature.
+   */
+  template <typename Evaluator>
+  void SortCatBins(Evaluator const &evaluator, common::ConstGHistRow feat_hist,
+                   common::Span<std::size_t> sorted_idx) const {
+    CHECK_EQ(feat_hist.size(), sorted_idx.size());
+    std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
+    std::stable_sort(sorted_idx.begin(), sorted_idx.end(), [&](std::size_t l, std::size_t r) {
+      return evaluator.CalcWeightCat(*param_, feat_hist[l]) <
+             evaluator.CalcWeightCat(*param_, feat_hist[r]);
+    });
+  }
+
+  /**
+   * @brief Order the bins of all partition-based categorical features using the root
+   *        histogram, used by `cat_order=tree`.
+   *
+   * All features are ordered regardless of the column sampling since the child nodes can
+   * sample different features than the root.
+   */
+  template <typename Evaluator>
+  void InitCatOrder(common::ConstGHistRow root_hist, common::HistogramCuts const &cut,
+                    common::Span<FeatureType const> feature_types, Evaluator const &evaluator) {
+    auto const &cut_ptrs = cut.Ptrs();
+    cat_order_.resize(cut.TotalBins());
+    common::ParallelFor(cut.NumFeatures(), ctx_->Threads(), [&](bst_feature_t fidx) {
+      if (!common::IsCat(feature_types, fidx)) {
+        return;
+      }
+      auto n_bins = cut_ptrs[fidx + 1] - cut_ptrs[fidx];
+      if (common::UseOneHot(n_bins, param_->max_cat_to_onehot)) {
+        return;
+      }
+      auto feat_hist = root_hist.subspan(cut_ptrs[fidx], n_bins);
+      auto sorted_idx =
+          common::Span<std::size_t>{cat_order_.data(), cat_order_.size()}.subspan(cut_ptrs[fidx],
+                                                                                  n_bins);
+      this->SortCatBins(evaluator, feat_hist, sorted_idx);
+    });
+  }
+
   // Enumerate/Scan the split values of specific feature
   // Returns the sum of gradients corresponding to the data points that contains
   // a non-missing value for the particular feature fid.
@@ -289,6 +340,18 @@ class HistEvaluator {
     auto evaluator = tree_evaluator_.GetEvaluator();
     auto const &cut_ptrs = cut.Ptrs();
 
+    bool const cat_order_per_tree = param_->cat_order == TrainParam::kTree;
+    if (cat_order_per_tree && !feature_types.empty()) {
+      bool has_root = std::any_of(entries.cbegin(), entries.cend(),
+                                  [](CPUExpandEntry const &e) { return e.nid == RegTree::kRoot; });
+      if (has_root) {
+        this->InitCatOrder(hist[RegTree::kRoot], cut, feature_types, evaluator);
+      }
+      // The root is always evaluated first. Otherwise there's no order to reuse.
+      CHECK_EQ(cat_order_.size(), static_cast<std::size_t>(cut.TotalBins()))
+          << "The root node must be evaluated before the other nodes when `cat_order=tree`.";
+    }
+
     common::ParallelFor2d(space, n_threads, [&](std::size_t nidx_in_set, common::Range1d r) {
       auto tidx = omp_get_thread_num();
       auto entry = &tloc_candidates[n_threads * nidx_in_set + tidx];
@@ -306,16 +369,18 @@ class HistEvaluator {
           auto n_bins = cut_ptrs.at(fidx + 1) - cut_ptrs[fidx];
           if (common::UseOneHot(n_bins, param_->max_cat_to_onehot)) {
             this->EnumerateOneHot(cut, histogram, fidx, nidx, evaluator, best);
+          } else if (cat_order_per_tree) {
+            // Reuse the order computed from the root node.
+            common::Span<std::size_t const> sorted_idx{cat_order_.data(), cat_order_.size()};
+            sorted_idx = sorted_idx.subspan(cut_ptrs[fidx], n_bins);
+            this->EnumeratePart<+1>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
+            this->EnumeratePart<-1>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
           } else {
             std::vector<size_t> sorted_idx(n_bins);
-            std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
             auto feat_hist = histogram.subspan(cut_ptrs[fidx], n_bins);
             // Sort the histogram to get contiguous partitions.
-            std::stable_sort(sorted_idx.begin(), sorted_idx.end(),
-                             [&](std::size_t l, std::size_t r) {
-                               return evaluator.CalcWeightCat(*param_, feat_hist[l]) <
-                                      evaluator.CalcWeightCat(*param_, feat_hist[r]);
-                             });
+            this->SortCatBins(evaluator, feat_hist,
+                              common::Span<std::size_t>{sorted_idx.data(), sorted_idx.size()});
             this->EnumeratePart<+1>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
             this->EnumeratePart<-1>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
           }
@@ -386,6 +451,7 @@ class HistEvaluator {
 
   float InitRoot(GradStats const &root_sum) {
     snode_.resize(1);
+    cat_order_.clear();
     auto root_evaluator = tree_evaluator_.GetEvaluator();
 
     snode_[0].stats = GradStats{root_sum.GetGrad(), root_sum.GetHess()};
@@ -418,6 +484,89 @@ class HistMultiEvaluator {
   FeatureInteractionConstraintHost interaction_constraints_;
   std::shared_ptr<common::ColumnSampler> column_sampler_;
   Context const *ctx_;
+  // Bin order of the partition-based categorical features computed from the root node,
+  // used by `cat_order=tree`. Feature `f` owns the range [cut_ptr[f], cut_ptr[f + 1]) and
+  // stores bin indices local to the feature. Reset by `InitRoot` for each tree.
+  std::vector<std::size_t> cat_order_;
+
+ private:
+  /**
+   * @brief Sort the bins of a categorical feature for partition-based split.
+   *
+   * @param node_hist  Histograms of a single node for all targets.
+   * @param base_weight Weight of the node that provides the update direction.
+   * @param sorted_idx Output, bin indices local to the feature.
+   */
+  template <typename BaseWeight>
+  void SortCatBins(TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                   common::HistogramCuts const &cut, bst_feature_t fidx,
+                   std::vector<common::ConstGHistRow> const &node_hist,
+                   BaseWeight const &base_weight, common::Span<std::size_t> sorted_idx) const {
+    auto const &cut_ptr = cut.Ptrs();
+    auto n_bins = sorted_idx.size();
+    auto n_targets = node_hist.size();
+    std::iota(sorted_idx.begin(), sorted_idx.end(), 0ul);
+    linalg::Vector<GradientPairPrecise> grads({n_targets}, this->ctx_->Device());
+    auto h_grads = grads.HostView();
+    std::vector<float> child_w(n_targets, .0f);
+
+    // Sort by s_c = w_p^T w_c
+    // Project onto the parent's update direction to compare scores l_s < r_s
+    // Since we care only about the ordering, no need to divide the norm.
+    std::vector<double> scores(n_bins);
+    for (std::size_t bin_idx = 0; bin_idx < n_bins; ++bin_idx) {
+      for (decltype(n_targets) t_idx = 0; t_idx < n_targets; ++t_idx) {
+        auto f_hist = node_hist[t_idx].subspan(cut_ptr[fidx], n_bins);
+        h_grads(t_idx) = f_hist[bin_idx];
+      }
+      evaluator.CalcWeightCat(*param_, h_grads, linalg::MakeVec(child_w.data(), child_w.size()));
+      double sc = .0;
+      for (decltype(n_targets) t_idx = 0; t_idx < n_targets; ++t_idx) {
+        sc += base_weight(t_idx) * child_w[t_idx];
+      }
+      scores[bin_idx] = sc;
+    }
+
+    std::stable_sort(sorted_idx.begin(), sorted_idx.end(),
+                     [&](std::size_t l, std::size_t r) { return scores[l] < scores[r]; });
+  }
+
+  /**
+   * @brief Order the bins of all partition-based categorical features using the root
+   *        histogram, used by `cat_order=tree`.
+   *
+   * All features are ordered regardless of the column sampling since the child nodes can
+   * sample different features than the root.
+   */
+  void InitCatOrder(TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                    common::Span<const BoundedHistCollection *> hist,
+                    common::HistogramCuts const &cut,
+                    common::Span<FeatureType const> feature_types) {
+    auto const &cut_ptr = cut.Ptrs();
+    std::vector<common::ConstGHistRow> root_hist;
+    for (auto t_hist : hist) {
+      root_hist.emplace_back((*t_hist)[RegTree::kRoot]);
+    }
+    auto root_sum = stats_.Slice(RegTree::kRoot, linalg::All());
+    auto root_weight = linalg::Zeros<float>(ctx_, root_sum.Shape());
+    auto h_rw = root_weight.HostView();
+    evaluator.CalcWeightCat(*param_, root_sum, h_rw);
+
+    cat_order_.resize(cut.TotalBins());
+    common::ParallelFor(cut.NumFeatures(), ctx_->Threads(), [&](bst_feature_t fidx) {
+      if (!common::IsCat(feature_types, fidx)) {
+        return;
+      }
+      auto n_bins = cut_ptr[fidx + 1] - cut_ptr[fidx];
+      if (common::UseOneHot(n_bins, param_->max_cat_to_onehot)) {
+        return;
+      }
+      auto sorted_idx =
+          common::Span<std::size_t>{cat_order_.data(), cat_order_.size()}.subspan(cut_ptr[fidx],
+                                                                                  n_bins);
+      this->SortCatBins(evaluator, cut, fidx, root_hist, h_rw, sorted_idx);
+    });
+  }
 
  private:
   template <bst_bin_t d_step>
@@ -634,6 +783,20 @@ class HistMultiEvaluator {
     }
 
     auto evaluator = tree_evaluator_.GetEvaluator();
+
+    bool const cat_order_per_tree = param_->cat_order == TrainParam::kTree;
+    if (cat_order_per_tree && !feature_types.empty()) {
+      bool has_root = std::any_of(entries.cbegin(), entries.cend(), [](MultiExpandEntry const &e) {
+        return e.nid == RegTree::kRoot;
+      });
+      if (has_root) {
+        this->InitCatOrder(evaluator, hist, cut, feature_types);
+      }
+      // The root is always evaluated first. Otherwise there's no order to reuse.
+      CHECK_EQ(cat_order_.size(), static_cast<std::size_t>(cut.TotalBins()))
+          << "The root node must be evaluated before the other nodes when `cat_order=tree`.";
+    }
+
     common::ParallelFor2d(space, n_threads, [&](std::size_t nidx_in_set, common::Range1d r) {
       auto tidx = omp_get_thread_num();
       auto entry = &tloc_candidates[n_threads * nidx_in_set + tidx];
@@ -649,7 +812,6 @@ class HistMultiEvaluator {
         node_hist.emplace_back((*t_hist)[entry->nid]);
       }
       auto features_set = features[nidx_in_set]->ConstHostSpan();
-      auto n_targets = hist.size();
 
       for (auto fidx_in_set = r.begin(); fidx_in_set < r.end(); fidx_in_set++) {
         auto fidx = features_set[fidx_in_set];
@@ -679,32 +841,19 @@ class HistMultiEvaluator {
         }
 
         // Partition split
-        std::vector<size_t> sorted_idx(n_bins);
-        std::iota(sorted_idx.begin(), sorted_idx.end(), 0ul);
-        linalg::Vector<GradientPairPrecise> grads({n_targets}, this->ctx_->Device());
-        auto h_grads = grads.HostView();
-        std::vector<float> child_w(n_targets, .0f);
-
-        // Sort by s_c = w_p^T w_c
-        // Project onto the parent's update direction to compare scores l_s < r_s
-        // Since we care only about the ordering, no need to divide the norm.
-        std::vector<double> scores(n_bins);
-        for (std::size_t bin_idx = 0; bin_idx < n_bins; ++bin_idx) {
-          for (decltype(n_targets) t_idx = 0; t_idx < n_targets; ++t_idx) {
-            auto f_hist = node_hist[t_idx].subspan(cut_ptr[fidx], n_bins);
-            h_grads(t_idx) = f_hist[bin_idx];
-          }
-          evaluator.CalcWeightCat(*param_, h_grads,
-                                  linalg::MakeVec(child_w.data(), child_w.size()));
-          double sc = .0;
-          for (decltype(n_targets) t_idx = 0; t_idx < n_targets; ++t_idx) {
-            sc += h_bw(t_idx) * child_w[t_idx];
-          }
-          scores[bin_idx] = sc;
+        std::vector<size_t> node_sorted_idx;
+        common::Span<std::size_t const> sorted_idx;
+        if (cat_order_per_tree) {
+          // Reuse the order computed from the root node.
+          common::Span<std::size_t const> tree_sorted_idx{cat_order_.data(), cat_order_.size()};
+          sorted_idx = tree_sorted_idx.subspan(cut_ptr[fidx], n_bins);
+        } else {
+          node_sorted_idx.resize(n_bins);
+          common::Span<std::size_t> s_node_sorted_idx{node_sorted_idx.data(),
+                                                      node_sorted_idx.size()};
+          this->SortCatBins(evaluator, cut, fidx, node_hist, h_bw, s_node_sorted_idx);
+          sorted_idx = s_node_sorted_idx;
         }
-
-        std::stable_sort(sorted_idx.begin(), sorted_idx.end(),
-                         [&](std::size_t l, std::size_t r) { return scores[l] < scores[r]; });
 
         this->EnumeratePart<+1>(cut, sorted_idx, node_hist, fidx, entry->nid, evaluator, best);
         this->EnumeratePart<-1>(cut, sorted_idx, node_hist, fidx, entry->nid, evaluator, best);
@@ -722,6 +871,7 @@ class HistMultiEvaluator {
     auto n_targets = root_sum.Size();
     stats_ = linalg::Constant(ctx_, GradientPairPrecise{}, 1, n_targets);
     gain_.resize(1);
+    cat_order_.clear();
 
     linalg::Vector<float> weight({n_targets}, ctx_->Device());
     auto evaluator = tree_evaluator_.GetEvaluator();

@@ -55,6 +55,8 @@ struct EvalParam {
   float learning_rate;
   std::uint32_t max_cat_to_onehot;
   bst_bin_t max_cat_threshold;
+  // Whether the category ordering is shared by all nodes in a tree, see TrainParam::CatOrder.
+  bool cat_order_per_tree;
 
   EvalParam() = default;
 
@@ -65,7 +67,8 @@ struct EvalParam {
         max_delta_step(param.max_delta_step),
         learning_rate{param.learning_rate},
         max_cat_to_onehot{param.max_cat_to_onehot},
-        max_cat_threshold{param.max_cat_threshold} {}
+        max_cat_threshold{param.max_cat_threshold},
+        cat_order_per_tree{param.cat_order == TrainParam::kTree} {}
 };
 
 class TreeEvaluator {

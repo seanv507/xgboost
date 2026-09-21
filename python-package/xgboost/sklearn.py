@@ -497,6 +497,18 @@ __model_doc = f"""
         needs to be set to have categorical feature support. See :doc:`Categorical Data
         </tutorials/categorical>` and :ref:`cat-param` for details.
 
+    cat_order : {Optional[str]}
+
+        .. versionadded:: 3.5.0
+
+        .. note:: This parameter is experimental
+
+        Scope of the category ordering used by partition-based splits. Available values
+        are ``node`` (the default), which orders the categories for every node, and
+        ``tree``, which orders them only once for every tree using the root node. Also,
+        `enable_categorical` needs to be set to have categorical feature support. See
+        :doc:`Categorical Data </tutorials/categorical>` and :ref:`cat-param` for details.
+
     multi_strategy : {Optional[str]}
 
         .. versionadded:: 2.0.0
@@ -909,6 +921,7 @@ class XGBModel(XGBModelBase):
         feature_weights: Optional[ArrayLike] = None,
         max_cat_to_onehot: Optional[int] = None,
         max_cat_threshold: Optional[int] = None,
+        cat_order: Optional[str] = None,
         multi_strategy: Optional[str] = None,
         eval_metric: Optional[Union[str, List[Union[str, Callable]], Callable]] = None,
         early_stopping_rounds: Optional[int] = None,
@@ -962,6 +975,7 @@ class XGBModel(XGBModelBase):
         self.feature_weights = feature_weights
         self.max_cat_to_onehot = max_cat_to_onehot
         self.max_cat_threshold = max_cat_threshold
+        self.cat_order = cat_order
         self.multi_strategy = multi_strategy
         self.eval_metric = eval_metric
         self.early_stopping_rounds = early_stopping_rounds

@@ -309,6 +309,22 @@ These parameters are only used for training with categorical data. See
   - Maximum number of categories considered for each split. Used only by partition-based
     splits for preventing over-fitting.
 
+* ``cat_order`` [default= ``node``]
+
+  .. versionadded:: 3.5.0
+
+  - Scope of the category ordering used by partition-based splits. Used only by the
+    ``hist``, ``approx`` and ``gpu_hist`` tree methods.
+
+    - ``node``: Sort the categories for every node using the histogram of that node.
+    - ``tree``: Sort the categories only once for every tree using the histogram of the root
+      node, and reuse the order for all nodes in the tree. This reduces the cost of split
+      finding for features with many categories, but the enumerated partitions are limited to
+      the ones that are contiguous in the root ordering, so the model quality might be lower.
+
+  - Currently not supported by the multi-target GPU tree builder with partition-based
+    splits.
+
 Additional dropout parameters for tree boosters
 ================================================
 

@@ -42,6 +42,12 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
 
   bst_bin_t max_cat_threshold{64};
 
+  // Scope at which the histogram bins of a categorical feature are ordered for
+  // partition-based splits. `kNode` sorts for every node, `kTree` sorts once at the root
+  // and reuses the order for the rest of the tree.
+  enum CatOrder { kNode = 0, kTree = 1 };
+  int cat_order{kNode};
+
   //----- the rest parameters are less important ----
   // minimum amount of hessian(weight) allowed in a child
   float min_child_weight;
@@ -115,6 +121,14 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
         .describe(
             "Maximum number of categories considered for split. Used only by partition-based"
             "splits.");
+    DMLC_DECLARE_FIELD(cat_order)
+        .set_default(kNode)
+        .add_enum("node", kNode)
+        .add_enum("tree", kTree)
+        .describe(
+            "Scope of the category ordering used by partition-based splits. `node` orders the "
+            "categories for every node, `tree` orders them once for every tree using the root "
+            "node.");
     DMLC_DECLARE_FIELD(min_child_weight)
         .set_lower_bound(0.0f)
         .set_default(1.0f)

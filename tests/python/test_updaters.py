@@ -317,6 +317,40 @@ class TestTreeMethod:
             rows, cols, cats, device="cpu", tree_method="hist", extmem=False
         )
 
+    @given(
+        tm.categorical_dataset_strategy,
+        strategies.integers(2, 8),
+        strategies.sampled_from(["hist", "approx"]),
+    )
+    @settings(deadline=None, print_blob=True, max_examples=10)
+    @pytest.mark.skipif(**tm.no_pandas())
+    def test_categorical_cat_order(
+        self, dataset: tm.TestDataset, n_rounds: int, tree_method: str
+    ) -> None:
+        dmat = dataset.get_dmat()
+        params: Dict[str, Any] = {
+            "tree_method": tree_method,
+            "max_cat_to_onehot": self.USE_PART,
+            "cat_order": "tree",
+        }
+        results = train_result(params, dmat, n_rounds)
+        tm.non_increasing(results["train"]["rmse"])
+
+        # The order is computed with the root node, so it's the same as sorting for every
+        # node if we only have the root split.
+        params["max_depth"] = 1
+        booster_tree = xgb.train(params, dmat, n_rounds)
+        params["cat_order"] = "node"
+        booster_node = xgb.train(params, dmat, n_rounds)
+        np.testing.assert_allclose(
+            booster_tree.predict(dmat), booster_node.predict(dmat)
+        )
+
+        # The parameter doesn't change the model format.
+        loaded = xgb.Booster()
+        loaded.load_model(booster_tree.save_raw("ubj"))
+        np.testing.assert_allclose(booster_tree.predict(dmat), loaded.predict(dmat))
+
     @pytest.mark.parametrize("cats", [32, 64])
     @pytest.mark.parametrize("multi_target", [False, True])
     def test_categorical_bitfield_boundaries(

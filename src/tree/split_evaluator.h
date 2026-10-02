@@ -57,6 +57,9 @@ struct EvalParam {
   bst_bin_t max_cat_threshold;
   // Whether the category ordering is shared by all nodes in a tree, see TrainParam::CatOrder.
   bool cat_order_per_tree;
+  // Additional L2 regularization applied only to the hessian used for ordering
+  // categories, see TrainParam::cat_reg_lambda.
+  float cat_reg_lambda;
 
   EvalParam() = default;
 
@@ -68,7 +71,8 @@ struct EvalParam {
         learning_rate{param.learning_rate},
         max_cat_to_onehot{param.max_cat_to_onehot},
         max_cat_threshold{param.max_cat_threshold},
-        cat_order_per_tree{param.cat_order == TrainParam::kTree} {}
+        cat_order_per_tree{param.cat_order == TrainParam::kTree},
+        cat_reg_lambda{param.cat_reg_lambda} {}
 };
 
 class TreeEvaluator {
@@ -293,7 +297,12 @@ class TreeEvaluator {
       // FIXME(jiamingy): This is a temporary solution until we have categorical feature
       // specific regularization parameters.  During sorting we should try to avoid any
       // regularization.
-      return ::xgboost::tree::CalcWeight(param, stats);
+      //
+      // `cat_reg_lambda` is one such categorical-specific parameter: it adds extra L2
+      // regularization to the hessian used only for ordering categories, independent of
+      // `reg_lambda`'s effect on the real leaf weight/gain computed elsewhere.
+      return ::xgboost::tree::CalcWeight(param, stats.GetGrad(),
+                                         stats.GetHess() + param.cat_reg_lambda);
     }
     template <typename GradientSumT, split_impl::EnableVecGrad<GradientSumT> = 0>
     XGBOOST_DEVICE void CalcWeightCat(ParamT const& param, GradientSumT const& stats,

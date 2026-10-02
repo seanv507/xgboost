@@ -587,4 +587,56 @@ TEST_F(TestPartitionBasedSplit, GpuHistCatOrderTree) {
       eval.CalcSplitGain(param_, 1, 0, GradStats{chosen}, GradStats{rest}) - parent_gain;
   ASSERT_NEAR(chosen_score, child_entry.split.loss_chg, 1e-2);
 }
+
+TEST_F(TestPartitionBasedSplit, GpuHistCatRegLambda) {
+  auto ctx = MakeCUDACtx(0);
+  param_.UpdateAllowUnknown(Args{{"cat_reg_lambda", "1e6"}});
+  dh::device_vector<FeatureType> ft{std::vector<FeatureType>{FeatureType::kCategorical}};
+  GPUHistEvaluator evaluator{param_, static_cast<bst_feature_t>(info_.num_col_), ctx.Device()};
+
+  cuts_.cut_ptrs_.SetDevice(ctx.Device());
+  cuts_.cut_values_.SetDevice(ctx.Device());
+  evaluator.Reset(&ctx, cuts_, dh::ToSpan(ft), info_.num_col_, param_);
+
+  auto quantiser = DummyRoundingFactor(&ctx);
+  thrust::host_vector<GradientPairInt64> h_hist;
+  for (auto e : hist_[0]) {
+    h_hist.push_back(quantiser.ToFixedPoint(e));
+  }
+  dh::device_vector<GradientPairInt64> d_hist = h_hist;
+  dh::device_vector<bst_feature_t> feature_set{std::vector<bst_feature_t>{0}};
+
+  EvaluateSplitInputs input{0, 0, quantiser.ToFixedPoint(total_gpair_), dh::ToSpan(feature_set),
+                            dh::ToSpan(d_hist)};
+  EvaluateSplitSharedInputs shared_inputs{EvalParam{param_},
+                                          quantiser,
+                                          dh::ToSpan(ft),
+                                          cuts_.cut_ptrs_.ConstDeviceSpan(),
+                                          cuts_.cut_values_.ConstDeviceSpan(),
+                                          false};
+  auto split = evaluator.EvaluateSingleSplit(&ctx, input, shared_inputs).split;
+
+  // Cross-check against the CPU formula: as cat_reg_lambda grows, the sort key
+  // (-grad / (hess + cat_reg_lambda)) converges to ascending order by -sum_grad, i.e.
+  // descending sum_grad, which is independently computable.
+  TreeEvaluator tree_evaluator{param_, 1, DeviceOrd::CPU(), 1u};
+  auto eval = tree_evaluator.GetEvaluator();
+  auto root_hist = hist_[0];
+  std::vector<std::size_t> grad_order(n_bins_);
+  std::iota(grad_order.begin(), grad_order.end(), 0);
+  std::stable_sort(grad_order.begin(), grad_order.end(), [&](std::size_t l, std::size_t r) {
+    return root_hist[l].GetGrad() > root_hist[r].GetGrad();
+  });
+  auto parent_gain = eval.CalcGain(0, param_, GradStats{total_gpair_});
+  float expected_score = -std::numeric_limits<float>::infinity();
+  GradientPairPrecise prefix;
+  for (std::size_t i = 0; i + 1 < n_bins_; ++i) {
+    prefix += root_hist[grad_order[i]];
+    auto rest = total_gpair_ - prefix;
+    auto score =
+        eval.CalcSplitGain(param_, 0, 0, GradStats{prefix}, GradStats{rest}) - parent_gain;
+    expected_score = std::max(expected_score, score);
+  }
+  ASSERT_NEAR(split.loss_chg, expected_score, 1e-2);
+}
 }  // namespace xgboost::tree

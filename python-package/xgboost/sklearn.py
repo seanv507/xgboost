@@ -509,6 +509,18 @@ __model_doc = f"""
         `enable_categorical` needs to be set to have categorical feature support. See
         :doc:`Categorical Data </tutorials/categorical>` and :ref:`cat-param` for details.
 
+    cat_reg_lambda : {Optional[float]}
+
+        .. versionadded:: 3.5.0
+
+        .. note:: This parameter is experimental
+
+        Additional L2 regularization term, added only to the hessian used for ordering
+        categories in partition-based splits. It acts like a second `reg_lambda` that
+        affects only the sort statistic, not the real leaf weight or gain. Also,
+        `enable_categorical` needs to be set to have categorical feature support. See
+        :doc:`Categorical Data </tutorials/categorical>` and :ref:`cat-param` for details.
+
     multi_strategy : {Optional[str]}
 
         .. versionadded:: 2.0.0
@@ -922,6 +934,7 @@ class XGBModel(XGBModelBase):
         max_cat_to_onehot: Optional[int] = None,
         max_cat_threshold: Optional[int] = None,
         cat_order: Optional[str] = None,
+        cat_reg_lambda: Optional[float] = None,
         multi_strategy: Optional[str] = None,
         eval_metric: Optional[Union[str, List[Union[str, Callable]], Callable]] = None,
         early_stopping_rounds: Optional[int] = None,
@@ -976,6 +989,7 @@ class XGBModel(XGBModelBase):
         self.max_cat_to_onehot = max_cat_to_onehot
         self.max_cat_threshold = max_cat_threshold
         self.cat_order = cat_order
+        self.cat_reg_lambda = cat_reg_lambda
         self.multi_strategy = multi_strategy
         self.eval_metric = eval_metric
         self.early_stopping_rounds = early_stopping_rounds

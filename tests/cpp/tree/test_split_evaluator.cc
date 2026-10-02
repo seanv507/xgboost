@@ -163,4 +163,32 @@ TEST(TreeEvaluator, ConstrainedVectorGainWithZeroHessianTarget) {
   // Raw explicit gains include both regularized leaves: -4/9 + 16/9 = 4/3.
   EXPECT_NEAR(evaluator.CalcSplitGain(param, 0, 0, h_left, h_right), 4.0 / 3.0, kRtEps);
 }
+
+TEST(TreeEvaluator, CalcWeightCatRegLambda) {
+  GradStats stats{8.0, 2.0};
+
+  TrainParam param;
+  param.UpdateAllowUnknown(
+      Args{{"reg_lambda", "1"}, {"reg_alpha", "0"}, {"cat_reg_lambda", "3"}});
+  TreeEvaluator tree_evaluator{param, 1, DeviceOrd::CPU(), 1u};
+  auto evaluator = tree_evaluator.GetEvaluator();
+  // dw = -grad / (hess + cat_reg_lambda + reg_lambda) = -8 / (2 + 3 + 1) = -8/6
+  ASSERT_FLOAT_EQ(evaluator.CalcWeightCat(param, stats), -8.0f / 6.0f);
+
+  // cat_reg_lambda=0 (the default) must reproduce the un-smoothed CalcWeight exactly.
+  TrainParam param0;
+  param0.UpdateAllowUnknown(Args{{"reg_lambda", "1"}, {"reg_alpha", "0"}});
+  TreeEvaluator tree_evaluator0{param0, 1, DeviceOrd::CPU(), 1u};
+  auto evaluator0 = tree_evaluator0.GetEvaluator();
+  ASSERT_EQ(evaluator0.CalcWeightCat(param0, stats), evaluator0.CalcWeight(0, param0, stats));
+
+  // reg_alpha still applies to the numerator, orthogonally to cat_reg_lambda.
+  TrainParam param_alpha;
+  param_alpha.UpdateAllowUnknown(
+      Args{{"reg_lambda", "1"}, {"reg_alpha", "1"}, {"cat_reg_lambda", "3"}});
+  TreeEvaluator te_alpha{param_alpha, 1, DeviceOrd::CPU(), 1u};
+  auto eval_alpha = te_alpha.GetEvaluator();
+  // ThresholdL1(8, 1) = 7; dw = -7 / (2 + 3 + 1) = -7/6
+  ASSERT_FLOAT_EQ(eval_alpha.CalcWeightCat(param_alpha, stats), -7.0f / 6.0f);
+}
 }  // namespace xgboost::tree

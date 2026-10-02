@@ -48,6 +48,11 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
   enum CatOrder { kNode = 0, kTree = 1 };
   int cat_order{kNode};
 
+  // Additional L2 regularization applied only to the hessian used for ordering categories
+  // in partition-based splits. Acts like a separate `reg_lambda` that affects only the
+  // sort statistic, not the real leaf weight or gain.
+  float cat_reg_lambda{0.0f};
+
   //----- the rest parameters are less important ----
   // minimum amount of hessian(weight) allowed in a child
   float min_child_weight;
@@ -129,6 +134,12 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
             "Scope of the category ordering used by partition-based splits. `node` orders the "
             "categories for every node, `tree` orders them once for every tree using the root "
             "node.");
+    DMLC_DECLARE_FIELD(cat_reg_lambda)
+        .set_lower_bound(0.0f)
+        .set_default(0.0f)
+        .describe(
+            "Additional L2 regularization term, added only to the hessian used for ordering "
+            "categories. Used only by partition-based splits.");
     DMLC_DECLARE_FIELD(min_child_weight)
         .set_lower_bound(0.0f)
         .set_default(1.0f)

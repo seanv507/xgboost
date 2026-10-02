@@ -73,6 +73,7 @@ cat_parameter_strategy = strategies.fixed_dictionaries(
     {
         "max_cat_to_onehot": strategies.integers(1, 128),
         "max_cat_threshold": strategies.integers(1, 128),
+        "cat_reg_lambda": strategies.floats(1e-5, 10.0),
     }
 )
 

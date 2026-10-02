@@ -264,4 +264,46 @@ TEST_F(GpuMultiHistEvaluatorBasicTest, CategoricalPartition) {
   ASSERT_EQ(no_split.left_sum, 8.0);
   ASSERT_EQ(no_split.right_sum, 0.0);
 }
+
+TEST_F(GpuMultiHistEvaluatorBasicTest, CategoricalPartitionCatRegLambda) {
+  // Bin 1 has a small hessian relative to its gradient (a large raw weight), bin 2 has a
+  // larger hessian but an even larger gradient magnitude (a smaller raw weight). A large
+  // cat_reg_lambda reverses their relative order in the sort, which should change which
+  // categories end up grouped together by the partition search.
+  parent_sum[0] = GradientPairInt64{-36, 10};
+  parent_sum[1] = GradientPairInt64{-36, 10};
+
+  histogram[0] = GradientPairInt64{-3, 2};
+  histogram[1] = GradientPairInt64{-10, 1};
+  histogram[2] = GradientPairInt64{-20, 5};
+  histogram[3] = GradientPairInt64{-3, 2};
+  histogram[4] = GradientPairInt64{-3, 2};
+  histogram[5] = GradientPairInt64{-10, 1};
+  histogram[6] = GradientPairInt64{-20, 5};
+  histogram[7] = GradientPairInt64{-3, 2};
+
+  auto param = this->MakeParam(Args{{"max_cat_to_onehot", "1"}});
+  auto shared = this->MakeCategoricalInputs(param);
+  MultiHistEvaluator evaluator;
+  evaluator.Reset(&ctx, shared.feature_segments, shared.feature_types, param, shared.Targets());
+  auto baseline = evaluator.EvaluateSingleSplit(&ctx, input, shared);
+  ASSERT_TRUE(baseline.split.is_cat);
+  auto d_baseline_cats = evaluator.GetNodeCats(baseline.nidx);
+  std::vector<std::uint32_t> baseline_cats(d_baseline_cats.size());
+  dh::CopyDeviceSpanToVector(&baseline_cats, d_baseline_cats);
+
+  auto smooth_param =
+      this->MakeParam(Args{{"max_cat_to_onehot", "1"}, {"cat_reg_lambda", "1000"}});
+  auto smooth_shared = this->MakeCategoricalInputs(smooth_param);
+  MultiHistEvaluator smooth_evaluator;
+  smooth_evaluator.Reset(&ctx, smooth_shared.feature_segments, smooth_shared.feature_types,
+                         smooth_param, smooth_shared.Targets());
+  auto smoothed = smooth_evaluator.EvaluateSingleSplit(&ctx, input, smooth_shared);
+  ASSERT_TRUE(smoothed.split.is_cat);
+  auto d_smoothed_cats = smooth_evaluator.GetNodeCats(smoothed.nidx);
+  std::vector<std::uint32_t> smoothed_cats(d_smoothed_cats.size());
+  dh::CopyDeviceSpanToVector(&smoothed_cats, d_smoothed_cats);
+
+  EXPECT_NE(baseline_cats, smoothed_cats);
+}
 }  // namespace xgboost::tree::cuda_impl

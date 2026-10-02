@@ -346,6 +346,52 @@ TEST_F(TestPartitionBasedSplit, CPUHistCatOrderTreeNoRoot) {
   ASSERT_THROW(evaluator.EvaluateSplits(hist_, cuts_, {ft}, &entries), dmlc::Error);
 }
 
+TEST_F(TestPartitionBasedSplit, CPUHistCatRegLambda) {
+  Context ctx;
+  auto root_hist = hist_[0];
+  param_.UpdateAllowUnknown(Args{{"cat_reg_lambda", "1e6"}});
+
+  // As cat_reg_lambda grows, CalcWeightCat's sort key (-grad / (hess + cat_reg_lambda))
+  // converges to ascending order by -sum_grad, i.e. descending sum_grad, since the
+  // hessian's contribution to the denominator becomes negligible next to it. This is
+  // verified independently of the partition search below.
+  TreeEvaluator te{param_, 1, DeviceOrd::CPU(), 1u};
+  auto eval = te.GetEvaluator();
+
+  std::vector<std::size_t> lambda_order(n_bins_), grad_order(n_bins_);
+  std::iota(lambda_order.begin(), lambda_order.end(), 0);
+  std::iota(grad_order.begin(), grad_order.end(), 0);
+  std::stable_sort(lambda_order.begin(), lambda_order.end(), [&](std::size_t l, std::size_t r) {
+    return eval.CalcWeightCat(param_, root_hist[l]) < eval.CalcWeightCat(param_, root_hist[r]);
+  });
+  std::stable_sort(grad_order.begin(), grad_order.end(), [&](std::size_t l, std::size_t r) {
+    return root_hist[l].GetGrad() > root_hist[r].GetGrad();
+  });
+  ASSERT_EQ(lambda_order, grad_order);
+
+  // Integration check: EvaluateSplits with the large cat_reg_lambda finds the best prefix
+  // of the grad-only order above, independently computable from the fixture's histogram.
+  std::vector<FeatureType> ft{FeatureType::kCategorical};
+  auto sampler = std::make_shared<common::ColumnSampler>();
+  HistEvaluator evaluator{&ctx, &param_, info_, sampler};
+  evaluator.InitRoot(GradStats{total_gpair_});
+  std::vector<CPUExpandEntry> entries(1);
+  evaluator.EvaluateSplits(hist_, cuts_, {ft}, &entries);
+
+  auto parent_gain = eval.CalcGain(0, param_, GradStats{total_gpair_});
+  float expected_score = -std::numeric_limits<float>::infinity();
+  GradientPairPrecise prefix;
+  for (std::size_t i = 0; i + 1 < n_bins_; ++i) {
+    prefix += root_hist[grad_order[i]];
+    auto rest = total_gpair_ - prefix;
+    auto score =
+        eval.CalcSplitGain(param_, 0, 0, GradStats{prefix}, GradStats{rest}) - parent_gain;
+    expected_score = std::max(expected_score, score);
+  }
+  ASSERT_TRUE(entries.front().split.is_cat);
+  ASSERT_NEAR(entries.front().split.loss_chg, expected_score, 1e-4);
+}
+
 namespace {
 auto CompareOneHotAndPartition(bool onehot) {
   Context ctx;
@@ -587,6 +633,26 @@ TEST_F(TestHistMultiEvaluator, CategoricalPartitionCatOrderTree) {
   for (bst_target_t t = 0; t < kNTargets; ++t) {
     ASSERT_EQ(split.left_sum[t] + split.right_sum[t], root_sum_(t));
   }
+}
+
+TEST_F(TestHistMultiEvaluator, CategoricalPartitionCatRegLambda) {
+  // Bin 1 has a tiny hessian (so a huge raw weight), bin 2 has a larger hessian but a
+  // larger gradient magnitude (so a small raw weight). A large cat_reg_lambda reverses
+  // their relative order in the sort, which should change which categories end up
+  // grouped together by the partition search.
+  std::vector<std::vector<GradientPairPrecise>> const hist_data{
+      {{-3.0, 1.0}, {-1.0, 0.01}, {-5.0, 10.0}},     // t-0
+      {{-3.0, 1.0}, {-1.0, 0.01}, {-5.0, 10.0}}};    // t-1
+
+  this->SetHistData(hist_data);
+  this->EvaluateSplits(Args{{"max_cat_to_onehot", "1"}});
+  ASSERT_TRUE(entries_.front().split.is_cat);
+  auto const baseline_bits = entries_.front().split.cat_bits;
+
+  this->SetHistData(hist_data);
+  this->EvaluateSplits(Args{{"max_cat_to_onehot", "1"}, {"cat_reg_lambda", "1000"}});
+  ASSERT_TRUE(entries_.front().split.is_cat);
+  EXPECT_NE(entries_.front().split.cat_bits, baseline_bits);
 }
 
 }  // namespace xgboost::tree

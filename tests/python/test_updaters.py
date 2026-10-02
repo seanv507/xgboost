@@ -351,6 +351,60 @@ class TestTreeMethod:
         loaded.load_model(booster_tree.save_raw("ubj"))
         np.testing.assert_allclose(booster_tree.predict(dmat), loaded.predict(dmat))
 
+    @given(
+        tm.categorical_dataset_strategy,
+        strategies.integers(2, 8),
+        strategies.sampled_from(["hist", "approx"]),
+    )
+    @settings(deadline=None, print_blob=True, max_examples=10)
+    @pytest.mark.skipif(**tm.no_pandas())
+    def test_categorical_cat_reg_lambda(
+        self, dataset: tm.TestDataset, n_rounds: int, tree_method: str
+    ) -> None:
+        dmat = dataset.get_dmat()
+        params: Dict[str, Any] = {
+            "tree_method": tree_method,
+            "max_cat_to_onehot": self.USE_PART,
+            "cat_reg_lambda": 1.0,
+        }
+        results = train_result(params, dmat, n_rounds)
+        tm.non_increasing(results["train"]["rmse"])
+
+        # The parameter doesn't change the model format.
+        booster = xgb.train(params, dmat, n_rounds)
+        loaded = xgb.Booster()
+        loaded.load_model(booster.save_raw("ubj"))
+        np.testing.assert_allclose(booster.predict(dmat), loaded.predict(dmat))
+
+    @pytest.mark.skipif(**tm.no_pandas())
+    def test_categorical_cat_reg_lambda_high_cardinality(self) -> None:
+        import pandas as pd
+
+        # Synthetic high-cardinality categorical feature where most categories have very
+        # few rows, and the label is driven by a smooth, low-cardinality signal plus
+        # noise, so per-category gradient/hessian sums are individually noisy.
+        rng = np.random.default_rng(0)
+        n = 4096
+        n_cats = 512  # high cardinality, ~8 rows/category on average
+        cat = rng.integers(0, n_cats, size=n)
+        signal = (cat % 4).astype(np.float64)  # true structure has only 4 groups
+        y = signal + rng.normal(scale=2.0, size=n)  # noisy label
+        X = pd.DataFrame({"cat": pd.Series(cat, dtype="category")})
+        dtrain = xgb.DMatrix(X, y, enable_categorical=True)
+
+        params_base = {
+            "tree_method": "hist",
+            "max_cat_to_onehot": self.USE_PART,
+            "max_depth": 3,
+        }
+        booster_0 = xgb.train({**params_base, "cat_reg_lambda": 0.0}, dtrain, 20)
+        booster_smooth = xgb.train({**params_base, "cat_reg_lambda": 50.0}, dtrain, 20)
+
+        pred_0 = booster_0.predict(dtrain)
+        pred_smooth = booster_smooth.predict(dtrain)
+        # The smoothed model's predictions must differ materially from the unsmoothed one.
+        assert not np.allclose(pred_0, pred_smooth)
+
     @pytest.mark.parametrize("cats", [32, 64])
     @pytest.mark.parametrize("multi_target", [False, True])
     def test_categorical_bitfield_boundaries(

@@ -325,6 +325,18 @@ These parameters are only used for training with categorical data. See
   - Currently not supported by the multi-target GPU tree builder with partition-based
     splits.
 
+* ``cat_reg_lambda`` [default= ``0.0``]
+
+  .. versionadded:: 3.5.0
+
+  - Additional L2 regularization term, added only to the hessian used for ordering
+    categories in partition-based splits. It acts like a second ``reg_lambda`` that
+    affects only the sort statistic used to find a contiguous partition of categories,
+    not the real leaf weight or gain. Increasing it shrinks the sort statistic of
+    categories with a small hessian sum toward zero, which stabilizes the resulting
+    category order for high-cardinality features with many sparsely-populated
+    categories. Used only by partition-based splits.
+
 Additional dropout parameters for tree boosters
 ================================================
 
